@@ -1,0 +1,21 @@
+# --- web server ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+
+# --- PDF -> Markdown engines (all optional; the app degrades gracefully) ---
+pymupdf>=1.24            # engine: pymupdf-raw
+pymupdf4llm>=0.0.17      # engine: pymupdf4llm
+markitdown[pdf]>=0.1.0   # engine: markitdown
+pdf-inspector>=0.2.0     # engine: pdf-inspector
+pdfplumber>=0.11         # engine: pdfplumber
+pdfminer.six>=20231228   # engine: pdfminer
+firecrawl-anydoc>=0.1.1  # engine: anydoc (imports as `anydoc`)
+
+# Heavy / optional. Downloads ML models on first run.
+docling>=2.0             # engine: docling
+
+# NOT pip-installable — listed here only so `pip install -r` doesn't need
+# editing when you wire it up. engine: unlimited-ocr
+# Needs a local SGLang/vLLM/transformers GPU server (Linux/CUDA) hosting
+# multi-GB weights. See https://github.com/baidu/Unlimited-OCR
