@@ -127,9 +127,9 @@ frontend/
                       decides the mode, plus upload/convert/release
   metrics.js          quality heuristics (structure / cleanliness / integrity)
   pdf-loader.js       wires up the vendored pdf.js module + worker
-  pdf-worker-shim.mjs worker entry point: polyfill, then the real worker
-  upsert-polyfill.mjs Map.prototype.getOrInsertComputed, which pdf.js needs
-                      and no browser ships yet
+  pdf-worker-shim.mjs worker entry point: polyfills, then the real worker
+  compat-polyfills.mjs the modern JS built-ins pdf.js assumes but current
+                      browsers don't all ship (see Notes)
   vendor/pdfjs/       vendored pdf.js build (Apache-2.0, Mozilla)
   styles.css          design tokens, dark + light
 backend/
@@ -168,11 +168,16 @@ are driven off the engine list the active mode reports.
   `pyo3`'s `PanicException`, which does not derive from `Exception`. The runner
   catches it anyway so one panicking engine costs you its own card and not the
   whole run.
-- The vendored pdf.js calls `Map.prototype.getOrInsertComputed`, from TC39's
-  [upsert proposal](https://github.com/tc39/proposal-upsert), which no browser
-  ships yet — `frontend/upsert-polyfill.mjs` supplies it to both the main
-  thread and the worker. Without it, browser mode fails on every PDF. Delete it
-  once browsers catch up.
+- The vendored pdf.js build assumes bleeding-edge JS built-ins that no single
+  current browser fully ships: `Map.prototype.getOrInsertComputed` (TC39
+  [upsert](https://github.com/tc39/proposal-upsert); missing everywhere, incl.
+  Chromium), `ReadableStream` async iteration (missing in Safari — its absence
+  killed every text extraction on iOS with "undefined is not a function"),
+  plus `Promise.try`, `Promise.withResolvers`, `Uint8Array` base64/hex codecs,
+  `Math.sumPrecise` and the `Iterator` global (missing in Safari below
+  18.2–18.4). `frontend/compat-polyfills.mjs` fills whichever are absent, in
+  both the main thread and the worker; each shim is skipped where the native
+  exists, so the file shrinks to a no-op as browsers catch up.
 - The heuristics in browser mode are geometry-based, not ML-based: multi-column layouts,
   rotated text, and unusual table shapes will fool them more easily than
   they'd fool a layout model like Docling. Read the output, don't just trust
