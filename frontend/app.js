@@ -9,9 +9,11 @@
   const WEIGHTS = { coverage: 0.30, structure: 0.25, cleanliness: 0.25, integrity: 0.20 };
 
   const state = {
+    mode: "local",       // "server" = Python engines via backend/main.py, "local" = pdf.js
     engines: [],
     selected: new Set(),
-    file: null,          // { pdfDoc, blobUrl, filename, size_bytes, pages, producer, title, classification }
+    file: null,          // descriptor from prepareLocally() / prepareViaServer()
+    serverFileId: null,  // server mode only: the server's copy of the upload
     results: new Map(),  // engineId -> { status, data, scores, composite }
     sort: "score",
     view: "rendered",
@@ -242,6 +244,57 @@
     return { pages_needing_ocr: needsOcr, has_text_layer: needsOcr.length === 0 };
   }
 
+  /** Local mode: pdf.js is both the parser and every engine, so the document
+   *  is opened here and kept for the run. */
+  async function prepareLocally(file) {
+    const buf = await file.arrayBuffer();
+    // The loading task, not the document proxy, is what tears a pdf.js
+    // document down again, so it is kept for releaseFile().
+    const loadingTask = window.pdfjsLib.getDocument({ data: buf });
+    let pdfDoc;
+    try {
+      pdfDoc = await loadingTask.promise;
+    } catch (err) {
+      loadingTask.destroy().catch(() => {});
+      throw new Error(err && err.name === "PasswordException"
+        ? "This PDF is encrypted; converters cannot read it."
+        : `Could not read this PDF (${err.message || err}).`);
+    }
+    const meta = await pdfDoc.getMetadata().catch(() => null);
+    const info = (meta && meta.info) || {};
+    return {
+      pdfDoc,
+      loadingTask,
+      serverFileId: null,
+      filename: file.name || "document.pdf",
+      size_bytes: file.size,
+      pages: pdfDoc.numPages,
+      producer: (info.Producer || "").trim() || null,
+      title: (info.Title || "").trim() || null,
+      classification: await classifyPages(pdfDoc),
+    };
+  }
+
+  /** Server mode: the bytes go over once and the server reports on them with
+   *  PyMuPDF and pdf-inspector — a better probe than the pdf.js heuristic,
+   *  and it keeps the Python engines usable in browsers pdf.js won't run in.
+   *  It also rejects encrypted, oversized and non-PDF files with its own
+   *  message, which surfaces here unchanged. */
+  async function prepareViaServer(file) {
+    const meta = await window.ServerEngines.upload(file);
+    return {
+      pdfDoc: null,
+      loadingTask: null,
+      serverFileId: meta.file_id,
+      filename: meta.filename || file.name || "document.pdf",
+      size_bytes: meta.size_bytes ?? file.size,
+      pages: meta.pages || 0,
+      producer: meta.producer || null,
+      title: meta.title || null,
+      classification: meta.classification || null,
+    };
+  }
+
   async function uploadFile(file) {
     if (!file) return;
     if (!/\.pdf$/i.test(file.name) && file.type !== "application/pdf") {
@@ -250,34 +303,16 @@
     const dropzone = $("#dropzone");
     dropzone.classList.add("busy");
     try {
-      const buf = await file.arrayBuffer();
-      let pdfDoc;
-      try {
-        pdfDoc = await window.pdfjsLib.getDocument({ data: buf }).promise;
-      } catch (err) {
-        throw new Error(err && err.name === "PasswordException"
-          ? "This PDF is encrypted; converters cannot read it."
-          : `Could not read this PDF (${err.message || err}).`);
-      }
+      // Prepared before anything is committed, so a rejected file leaves the
+      // previously loaded one intact.
+      const descriptor = state.mode === "server"
+        ? await prepareViaServer(file)
+        : await prepareLocally(file);
+      descriptor.blobUrl = URL.createObjectURL(file);
 
-      const meta = await pdfDoc.getMetadata().catch(() => null);
-      const info = (meta && meta.info) || {};
-      const classification = await classifyPages(pdfDoc);
-
-      if (state.file) {
-        URL.revokeObjectURL(state.file.blobUrl);
-        state.file.pdfDoc.destroy();
-      }
-      state.file = {
-        pdfDoc,
-        blobUrl: URL.createObjectURL(file),
-        filename: file.name || "document.pdf",
-        size_bytes: file.size,
-        pages: pdfDoc.numPages,
-        producer: (info.Producer || "").trim() || null,
-        title: (info.Title || "").trim() || null,
-        classification,
-      };
+      releaseFile();
+      state.serverFileId = descriptor.serverFileId;
+      state.file = descriptor;
       state.results.clear();
       renderFileCard();
       $("#controls-panel").classList.remove("hidden");
@@ -312,11 +347,19 @@
     }
   }
 
-  function resetFile() {
+  /** Drop every handle on the currently loaded file: the preview blob, the
+   *  pdf.js document (local mode) and the server's temp copy (server mode). */
+  function releaseFile() {
     if (state.file) {
       URL.revokeObjectURL(state.file.blobUrl);
-      state.file.pdfDoc.destroy();
+      if (state.file.loadingTask) state.file.loadingTask.destroy().catch(() => {});
     }
+    window.ServerEngines.release(state.serverFileId);
+    state.serverFileId = null;
+  }
+
+  function resetFile() {
+    releaseFile();
     state.file = null;
     state.results.clear();
     $("#filecard").classList.add("hidden");
@@ -328,6 +371,19 @@
   }
 
   /* ── engine picker ──────────────────────────────────────────────────── */
+
+  function renderModePill() {
+    const pill = $("#mode-pill");
+    const server = state.mode === "server";
+    pill.textContent = server ? "Python engines" : "Browser engines";
+    pill.title = server
+      ? "Connected to a local bench server — conversions run in the Python "
+        + "libraries listed below, on your machine."
+      : "No bench server behind this page — conversions run in the browser on "
+        + "pdf.js. Start the server with `python run.py` for the Python engines.";
+    pill.classList.toggle("server", server);
+    pill.hidden = false;
+  }
 
   function renderEngines() {
     const grid = $("#engine-grid");
@@ -374,6 +430,30 @@
 
   /* ── run ────────────────────────────────────────────────────────────── */
 
+  /** One conversion, whichever engine backend this page is talking to.
+   *  Both branches return the same payload shape, so nothing downstream
+   *  (scoring, cards, table, drawer) needs to know which mode is active. */
+  async function convertOne(engineId, maxPages) {
+    if (state.mode === "server") {
+      // The server times the conversion itself and runs the Python port of
+      // metrics.js over the output, so the payload arrives complete.
+      return window.ServerEngines.convert(state.serverFileId, engineId, maxPages);
+    }
+
+    const result = await window.Engines.run(engineId, state.file.pdfDoc, maxPages);
+    const pagesConverted = maxPages ? Math.min(state.file.pages, maxPages) : state.file.pages;
+    return {
+      engine: engineId,
+      ok: result.ok,
+      error: result.error,
+      elapsed_ms: result.elapsed_ms,
+      pages_converted: pagesConverted,
+      ms_per_page: Math.round((result.elapsed_ms / Math.max(1, pagesConverted)) * 10) / 10,
+      markdown: result.markdown,
+      metrics: result.ok ? window.Metrics.analyse(result.markdown, pagesConverted) : null,
+    };
+  }
+
   async function runComparison() {
     if (!state.file || !state.selected.size) return;
     state.running = true;
@@ -391,19 +471,7 @@
     const started = performance.now();
     const runOne = async (id) => {
       try {
-        const result = await window.Engines.run(id, state.file.pdfDoc, maxPages);
-        const pagesConverted = maxPages ? Math.min(state.file.pages, maxPages) : state.file.pages;
-        const data = {
-          engine: id,
-          ok: result.ok,
-          error: result.error,
-          elapsed_ms: result.elapsed_ms,
-          pages_converted: pagesConverted,
-          ms_per_page: Math.round((result.elapsed_ms / Math.max(1, pagesConverted)) * 10) / 10,
-          markdown: result.markdown,
-          metrics: result.ok ? window.Metrics.analyse(result.markdown, pagesConverted) : null,
-        };
-        state.results.set(id, { status: "done", data, composite: null });
+        state.results.set(id, { status: "done", data: await convertOne(id, maxPages), composite: null });
       } catch (err) {
         state.results.set(id, {
           status: "done",
@@ -786,13 +854,23 @@
     });
   }
 
-  function init() {
+  async function init() {
     document.documentElement.dataset.theme = localStorage.getItem("bench-theme")
       || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
     bindEvents();
-    state.engines = window.Engines.list();
+
+    // A bench server, if there is one, brings the Python engines; otherwise
+    // the in-browser pdf.js engines are the whole field.
+    const serverEngines = await window.ServerEngines.probe();
+    state.mode = serverEngines ? "server" : "local";
+    state.engines = serverEngines || window.Engines.list();
+
+    renderModePill();
     state.engines.filter((e) => e.available && !e.heavy).forEach((e) => state.selected.add(e.id));
     renderEngines();
+
+    // The server holds a temp copy of the upload; drop it on the way out.
+    addEventListener("pagehide", () => window.ServerEngines.release(state.serverFileId));
   }
 
   init();

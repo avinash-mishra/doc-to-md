@@ -336,7 +336,13 @@ def run(engine_id: str, data: bytes, max_pages: int | None) -> dict:
     started = time.perf_counter()
     try:
         markdown = engine.fn(data, limit) or ""
-    except Exception as exc:  # a failing engine must not fail the comparison
+    except (KeyboardInterrupt, SystemExit, GeneratorExit):
+        raise
+    except BaseException as exc:  # a failing engine must not fail the comparison
+        # BaseException, not Exception: several engines here are Rust
+        # extensions, and a panic in one surfaces as pyo3's PanicException,
+        # which does not derive from Exception. Letting that escape would
+        # abort the whole run instead of just this engine's card.
         return {"ok": False,
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
                 "markdown": "",
