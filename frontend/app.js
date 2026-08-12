@@ -232,21 +232,36 @@
 
   /* ── upload ─────────────────────────────────────────────────────────── */
 
+  /** Best-effort: the OCR chips are a nicety, so a text-extraction failure
+   *  here (a browser gap in pdf.js, a damaged page) must not block the
+   *  upload — return null and let each engine succeed or fail on its own
+   *  card, where the error is visible and attributed. */
   async function classifyPages(pdfDoc) {
-    const needsOcr = [];
-    for (let i = 1; i <= pdfDoc.numPages; i++) {
-      const page = await pdfDoc.getPage(i);
-      const tc = await page.getTextContent();
-      const chars = tc.items.reduce((n, it) =>
-        n + (typeof it.str === "string" ? it.str.replace(/\s/g, "").length : 0), 0);
-      if (chars < 10) needsOcr.push(i);
+    try {
+      const needsOcr = [];
+      for (let i = 1; i <= pdfDoc.numPages; i++) {
+        const page = await pdfDoc.getPage(i);
+        const tc = await page.getTextContent();
+        const chars = tc.items.reduce((n, it) =>
+          n + (typeof it.str === "string" ? it.str.replace(/\s/g, "").length : 0), 0);
+        if (chars < 10) needsOcr.push(i);
+      }
+      return { pages_needing_ocr: needsOcr, has_text_layer: needsOcr.length === 0 };
+    } catch {
+      return null;
     }
-    return { pages_needing_ocr: needsOcr, has_text_layer: needsOcr.length === 0 };
   }
 
   /** Local mode: pdf.js is both the parser and every engine, so the document
    *  is opened here and kept for the run. */
   async function prepareLocally(file) {
+    if (!window.pdfjsLib) {
+      // pdf-loader.js failed — most likely an unsupported browser, or a
+      // stale cached module mix after a deploy. Fail with something
+      // actionable instead of whatever minified pdf.js internals threw.
+      throw new Error("The PDF engine did not load in this browser. "
+        + "Force-refresh the page; if it persists, the browser may be unsupported.");
+    }
     const buf = await file.arrayBuffer();
     // The loading task, not the document proxy, is what tears a pdf.js
     // document down again, so it is kept for releaseFile().

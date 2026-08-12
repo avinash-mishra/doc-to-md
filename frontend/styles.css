@@ -102,6 +102,7 @@ h1, h2, h3 { margin: 0; font-weight: 620; letter-spacing: -.018em; }
 .brand-mark svg { width: 22px; height: 22px; }
 .brand-text h1 { font-size: 17px; }
 .brand-text p { margin: 1px 0 0; font-size: 12.5px; color: var(--text-dim); }
+.brand-text #build-tag { color: var(--text-faint); font-variant-numeric: tabular-nums; }
 .topbar-actions { display: flex; align-items: center; gap: 8px; }
 
 /* which engine backend is live: pdf.js in the browser, or Python on a server */
